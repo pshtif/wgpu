@@ -1086,6 +1086,10 @@ pub struct CommandEncoder {
     counters: Arc<wgt::HalCounters>,
 
     current_pipeline_is_multiview: bool,
+    /// Kosuno experiment: resets so far (`kosuno_patch::release_every`).
+    kosuno_resets: u32,
+    /// Kosuno experiment (`kosuno_patch::adaptive`).
+    kosuno_adaptive: crate::kosuno_patch::Adaptive,
 }
 
 impl Drop for CommandEncoder {

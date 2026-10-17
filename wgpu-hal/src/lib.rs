@@ -264,6 +264,7 @@ pub mod noop;
 pub mod vulkan;
 
 pub mod auxil;
+pub mod kosuno_patch;
 pub mod api {
     #[cfg(dx12)]
     pub use super::dx12::Api as Dx12;
