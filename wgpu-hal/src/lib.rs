@@ -290,7 +290,7 @@ pub use dynamic::{
     DynDevice, DynExposedAdapter, DynFence, DynInstance, DynOpenDevice, DynPipelineCache,
     DynPipelineLayout, DynQuerySet, DynQueue, DynRayTracingPipeline, DynRenderPipeline,
     DynResource, DynSampler, DynShaderModule, DynSurface, DynSurfaceTexture, DynTexture,
-    DynTextureView,
+    DynTextureView, PassRecorder,
 };
 
 #[allow(unused)]

@@ -583,7 +583,7 @@ impl EncodingApi {
 /// commands into the middle of a recorded stream. However, hal queue submission
 /// accepts a series of command buffers at once, so we can simply break the
 /// stream up into multiple buffers, and then reorder the buffers. See
-/// [`InnerCommandEncoder::close_and_swap`] for a specific example of this.
+/// [`InnerCommandEncoder::close_and_push_front`] for a specific example of this.
 ///
 /// [rce]: hal::Api::CommandEncoder
 /// [rcb]: hal::Api::CommandBuffer
@@ -631,41 +631,6 @@ pub(crate) struct InnerCommandEncoder {
 }
 
 impl InnerCommandEncoder {
-    /// Finish the current command buffer and insert it just before
-    /// the last element in [`self.list`][l].
-    ///
-    /// On return, the underlying hal encoder is closed.
-    ///
-    /// What is this for?
-    ///
-    /// The `wgpu_hal` contract requires that each render or compute pass's
-    /// commands be preceded by calls to [`transition_buffers`] and
-    /// [`transition_textures`], to put the resources the pass operates on in
-    /// the appropriate state. Unfortunately, we don't know which transitions
-    /// are needed until we're done recording the pass itself. Rather than
-    /// iterating over the pass twice, we note the necessary transitions as we
-    /// record its commands, finish the raw command buffer for the actual pass,
-    /// record a new raw command buffer for the transitions, and jam that buffer
-    /// in just before the pass's. This is the function that jams in the
-    /// transitions' command buffer.
-    ///
-    /// # Panics
-    ///
-    /// - If the encoder is not open.
-    ///
-    /// # Warning
-    ///
-    /// Any [`DeferredQuerySetResolve::insertion_point`] pointing to the
-    /// last element will be invalidated.
-    ///
-    /// [l]: InnerCommandEncoder::list
-    /// [`transition_buffers`]: hal::CommandEncoder::transition_buffers
-    /// [`transition_textures`]: hal::CommandEncoder::transition_textures
-    /// [`DeferredQuerySetResolve::insertion_point`]: query::DeferredQuerySetResolve::insertion_point
-    fn close_and_swap(&mut self) -> Result<(), DeviceError> {
-        self.close_and_insert_at(self.list.len() - 1)
-    }
-
     /// Finish the current command buffer and insert it at the beginning
     /// of [`self.list`][l].
     ///

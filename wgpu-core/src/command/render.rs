@@ -2302,17 +2302,12 @@ pub(super) fn encode_render_pass(
 
     let mut indirect_draw_validation_batcher = crate::indirect_validation::DrawBatcher::new();
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    // Record the pass rather than encoding it: its barriers are only known
+    // once it is validated, and they must come before it. Both then go into
+    // the encoder's open command buffer, instead of a command buffer for
+    // the pass and another, submitted before it, for its barriers.
+    let mut recorder = hal::PassRecorder::new();
+    let raw_encoder: &mut dyn hal::DynCommandEncoder = &mut recorder;
 
     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
         let mut pending_query_resets = QueryResetMap::new();
@@ -2713,7 +2708,6 @@ pub(super) fn encode_render_pass(
 
         let pending_discard_init_fixups = state.pass.pending_discard_init_fixups;
 
-        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
         (trackers, pending_discard_init_fixups, pending_query_resets)
     };
 
@@ -2721,12 +2715,7 @@ pub(super) fn encode_render_pass(
     let tracker = &mut parent_state.tracker;
 
     {
-        let transit = encoder
-            .open_pass(hal_label(
-                Some("(wgpu internal) Pre Pass"),
-                device.instance_flags,
-            ))
-            .map_pass_err(pass_scope)?;
+        let transit = encoder.open_if_closed().map_pass_err(pass_scope)?;
 
         fixup_discarded_surfaces(
             pending_discard_init_fixups.into_iter(),
@@ -2760,9 +2749,10 @@ pub(super) fn encode_render_pass(
                 )
                 .map_pass_err(pass_scope)?;
         }
+        // SAFETY: every resource the pass recorded is held by `scope` and
+        // the command buffer's trackers, under the snatch guard.
+        unsafe { recorder.replay(transit) };
     }
-
-    encoder.close_and_swap().map_pass_err(pass_scope)?;
 
     Ok(())
 }
