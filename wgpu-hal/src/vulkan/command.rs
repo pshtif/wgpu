@@ -185,11 +185,30 @@ impl crate::CommandEncoder for super::CommandEncoder {
         for (_, framebuffer) in self.framebuffers.drain() {
             unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
         }
+        let mut kosuno_release = false;
         let _ = unsafe {
             self.device
                 .raw
-                .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default())
+                .reset_command_pool(self.raw, if crate::kosuno_patch::release_pools()
+                    || (crate::kosuno_patch::adaptive() && self.kosuno_adaptive.reset())
+                    || (crate::kosuno_patch::adaptive_global() && {
+                        let passes = core::mem::take(&mut self.kosuno_adaptive.passes);
+                        let release = crate::kosuno_patch::global_reset(passes, &mut self.kosuno_adaptive.epoch);
+                        kosuno_release = release;
+                        release && !crate::kosuno_patch::trim_pool()
+                    }) || {
+                    self.kosuno_resets = self.kosuno_resets.wrapping_add(1);
+                    crate::kosuno_patch::release_every().is_some_and(|n| self.kosuno_resets % n == 0)
+                } {
+                    vk::CommandPoolResetFlags::RELEASE_RESOURCES
+                } else {
+                    vk::CommandPoolResetFlags::default()
+                })
         };
+        // `adaptive5`: give back what the reset pool no longer uses.
+        if kosuno_release && crate::kosuno_patch::trim_pool() {
+            unsafe { self.device.raw.trim_command_pool(self.raw, vk::CommandPoolTrimFlags::empty()) };
+        }
     }
 
     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
@@ -783,6 +802,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         &mut self,
         desc: &crate::RenderPassDescriptor<super::QuerySet, super::TextureView>,
     ) -> Result<(), crate::DeviceError> {
+        self.kosuno_adaptive.passes += 1;
         let mut vk_clear_values =
             ArrayVec::<vk::ClearValue, { super::MAX_TOTAL_ATTACHMENTS }>::new();
         let mut rp_key = super::RenderPassKey {

@@ -264,6 +264,7 @@ pub mod noop;
 pub mod vulkan;
 
 pub mod auxil;
+pub mod kosuno_patch;
 pub mod api {
     #[cfg(dx12)]
     pub use super::dx12::Api as Dx12;
@@ -287,7 +288,7 @@ pub(crate) use dynamic::impl_dyn_resource;
 pub use dynamic::{
     DynAccelerationStructure, DynAcquiredSurfaceTexture, DynAdapter, DynBindGroup,
     DynBindGroupLayout, DynBuffer, DynCommandBuffer, DynCommandEncoder, DynComputePipeline,
-    DynDevice, DynExposedAdapter, DynFence, DynInstance, DynOpenDevice, DynPipelineCache,
+    DynDevice, DynExposedAdapter, DynFence, DynInstance, DynOpenDevice, DynPipelineCache, PassRecorder,
     DynPipelineLayout, DynQuerySet, DynQueue, DynRayTracingPipeline, DynRenderPipeline,
     DynResource, DynSampler, DynShaderModule, DynSurface, DynSurfaceTexture, DynTexture,
     DynTextureView,

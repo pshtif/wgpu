@@ -1061,8 +1061,11 @@ impl CommandEncoder {
             .collect::<Vec<_>>();
 
         unsafe {
-            raw.transition_buffers(&buffer_barriers);
-            raw.transition_textures(&texture_barriers);
+            // Kosuno negative control for validation runs: encode no barriers.
+            if !hal::kosuno_patch::drop_barriers() {
+                raw.transition_buffers(&buffer_barriers);
+                raw.transition_textures(&texture_barriers);
+            }
         }
     }
 
@@ -1085,8 +1088,11 @@ impl CommandEncoder {
             .collect::<Vec<_>>();
 
         unsafe {
-            raw.transition_buffers(&buffer_barriers);
-            raw.transition_textures(&texture_barriers);
+            // Kosuno negative control for validation runs: encode no barriers.
+            if !hal::kosuno_patch::drop_barriers() {
+                raw.transition_buffers(&buffer_barriers);
+                raw.transition_textures(&texture_barriers);
+            }
         }
     }
 

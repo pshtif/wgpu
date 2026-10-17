@@ -2302,17 +2302,25 @@ pub(super) fn encode_render_pass(
 
     let mut indirect_draw_validation_batcher = crate::indirect_validation::DrawBatcher::new();
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    // Kosuno experiment (`single`): record the pass, then encode its
+    // barriers and replay it into the encoder's open command buffer.
+    let single = hal::kosuno_patch::single_command_buffer();
+    let mut recorder = hal::PassRecorder::new();
+    let raw_encoder: &mut dyn hal::DynCommandEncoder = if single {
+        &mut recorder
+    } else {
+        // We automatically keep extending command buffers over time, and because
+        // we want to insert a command buffer _before_ what we're about to record,
+        // we need to make sure to close the previous one.
+        parent_state
+            .raw_encoder
+            .close_if_open()
+            .map_pass_err(pass_scope)?;
+        parent_state
+            .raw_encoder
+            .open_pass(base.label.as_deref())
+            .map_pass_err(pass_scope)?
+    };
 
     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
         let mut pending_query_resets = QueryResetMap::new();
@@ -2713,7 +2721,9 @@ pub(super) fn encode_render_pass(
 
         let pending_discard_init_fixups = state.pass.pending_discard_init_fixups;
 
-        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
+        if !single {
+            parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
+        }
         (trackers, pending_discard_init_fixups, pending_query_resets)
     };
 
@@ -2721,12 +2731,16 @@ pub(super) fn encode_render_pass(
     let tracker = &mut parent_state.tracker;
 
     {
-        let transit = encoder
-            .open_pass(hal_label(
-                Some("(wgpu internal) Pre Pass"),
-                device.instance_flags,
-            ))
-            .map_pass_err(pass_scope)?;
+        let transit = if single {
+            encoder.open_if_closed().map_pass_err(pass_scope)?
+        } else {
+            encoder
+                .open_pass(hal_label(
+                    Some("(wgpu internal) Pre Pass"),
+                    device.instance_flags,
+                ))
+                .map_pass_err(pass_scope)?
+        };
 
         fixup_discarded_surfaces(
             pending_discard_init_fixups.into_iter(),
@@ -2760,9 +2774,16 @@ pub(super) fn encode_render_pass(
                 )
                 .map_pass_err(pass_scope)?;
         }
+        if single {
+            // SAFETY: the pass's resources are held by `scope` and the
+            // command buffer's trackers, under the snatch guard.
+            unsafe { recorder.replay(transit) };
+        }
     }
 
-    encoder.close_and_swap().map_pass_err(pass_scope)?;
+    if !single {
+        encoder.close_and_swap().map_pass_err(pass_scope)?;
+    }
 
     Ok(())
 }

@@ -3,6 +3,7 @@ mod command;
 mod device;
 mod instance;
 mod queue;
+mod record;
 mod surface;
 
 pub use adapter::{DynAdapter, DynOpenDevice};
@@ -10,6 +11,7 @@ pub use command::DynCommandEncoder;
 pub use device::DynDevice;
 pub use instance::{DynExposedAdapter, DynInstance};
 pub use queue::DynQueue;
+pub use record::PassRecorder;
 pub use surface::{DynAcquiredSurfaceTexture, DynSurface};
 
 use alloc::boxed::Box;

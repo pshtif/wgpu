@@ -663,17 +663,25 @@ pub(super) fn encode_compute_pass(
 
     let device = parent_state.device;
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    // Kosuno experiment (`single`): record the pass, then encode its
+    // barriers and replay it into the encoder's open command buffer.
+    let single = hal::kosuno_patch::single_command_buffer();
+    let mut recorder = hal::PassRecorder::new();
+    let raw_encoder: &mut dyn hal::DynCommandEncoder = if single {
+        &mut recorder
+    } else {
+        // We automatically keep extending command buffers over time, and because
+        // we want to insert a command buffer _before_ what we're about to record,
+        // we need to make sure to close the previous one.
+        parent_state
+            .raw_encoder
+            .close_if_open()
+            .map_pass_err(pass_scope)?;
+        parent_state
+            .raw_encoder
+            .open_pass(base.label.as_deref())
+            .map_pass_err(pass_scope)?
+    };
 
     let mut debug_scope_depth = 0;
 
@@ -924,19 +932,23 @@ pub(super) fn encode_compute_pass(
         ..
     } = state;
 
-    // Stop the current command encoder.
-    parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
+    let transit = if single {
+        parent_state.raw_encoder.open_if_closed().map_pass_err(pass_scope)?
+    } else {
+        // Stop the current command encoder.
+        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
 
-    // Create a new command encoder, which we will insert _before_ the body of the compute pass.
-    //
-    // Use that buffer to insert barriers and clear discarded images.
-    let transit = parent_state
-        .raw_encoder
-        .open_pass(hal_label(
-            Some("(wgpu internal) Pre Pass"),
-            device.instance_flags,
-        ))
-        .map_pass_err(pass_scope)?;
+        // Create a new command encoder, which we will insert _before_ the body of the compute pass.
+        //
+        // Use that buffer to insert barriers and clear discarded images.
+        parent_state
+            .raw_encoder
+            .open_pass(hal_label(
+                Some("(wgpu internal) Pre Pass"),
+                device.instance_flags,
+            ))
+            .map_pass_err(pass_scope)?
+    };
     fixup_discarded_surfaces(
         pending_discard_init_fixups.into_iter(),
         transit,
@@ -950,11 +962,17 @@ pub(super) fn encode_compute_pass(
         &intermediate_trackers,
         parent_state.snatch_guard,
     );
-    // Close the command encoder, and swap it with the previous.
-    parent_state
-        .raw_encoder
-        .close_and_swap()
-        .map_pass_err(pass_scope)?;
+    if single {
+        // SAFETY: the pass's resources are held by the trackers, under the
+        // snatch guard.
+        unsafe { recorder.replay(transit) };
+    } else {
+        // Close the command encoder, and swap it with the previous.
+        parent_state
+            .raw_encoder
+            .close_and_swap()
+            .map_pass_err(pass_scope)?;
+    }
 
     Ok(())
 }

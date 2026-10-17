@@ -1395,6 +1395,8 @@ impl crate::Device for super::Device {
             free: Vec::new(),
             discarded: Vec::new(),
             rpass_debug_marker_active: false,
+            kosuno_resets: 0,
+            kosuno_adaptive: Default::default(),
             end_of_pass_timer_query: None,
             framebuffers: Default::default(),
             temp_texture_views: Default::default(),

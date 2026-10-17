@@ -1697,6 +1697,7 @@ impl Queue {
             .iter()
             .flat_map(|e| e.inner.list.iter().map(|b| b.as_ref()))
             .collect::<Vec<_>>();
+        hal::kosuno_patch::note_submit(hal_command_buffers.len());
 
         {
             let mut submit_surface_textures =
