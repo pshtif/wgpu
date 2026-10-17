@@ -3,7 +3,10 @@ use bit_vec::BitVec;
 use core::{iter, mem};
 
 use crate::{
-    command::{encoder::EncodingState, ArcCommand, EncoderStateError, InnerCommandEncoder},
+    command::{
+        encoder::EncodingState, pass_recorder::PassRecorder, ArcCommand, EncoderStateError,
+        InnerCommandEncoder,
+    },
     device::{Device, DeviceError, MissingFeatures},
     global::Global,
     id,
@@ -316,11 +319,34 @@ impl QuerySet {
         record_query_write(query_set_writes, self, query_index);
         Ok(())
     }
+
+    /// The pass version of [`Self::validate_and_write_timestamp`].
+    pub(super) fn validate_and_record_timestamp(
+        self: &Arc<Self>,
+        recorder: &mut PassRecorder,
+        query_index: u32,
+        reset_state: Option<&mut QueryResetMap>,
+        snatch_guard: &SnatchGuard<'_>,
+        query_set_writes: &mut QuerySetWrites,
+    ) -> Result<(), QueryUseError> {
+        let needs_reset = reset_state.is_none();
+        self.validate_query(SimplifiedQueryType::Timestamp, query_index, reset_state)?;
+        self.try_raw(snatch_guard)?;
+
+        // If we don't have a reset state tracker which can defer resets, we must reset now.
+        if needs_reset {
+            recorder.reset_queries(self, query_index..(query_index + 1));
+        }
+        recorder.write_timestamp(self, query_index);
+
+        record_query_write(query_set_writes, self, query_index);
+        Ok(())
+    }
 }
 
 pub(super) fn validate_and_begin_occlusion_query(
     query_set: Arc<QuerySet>,
-    raw_encoder: &mut dyn hal::DynCommandEncoder,
+    recorder: &mut PassRecorder,
     tracker: &mut QuerySetTracker,
     query_index: u32,
     reset_state: Option<&mut QueryResetMap>,
@@ -340,28 +366,25 @@ pub(super) fn validate_and_begin_occlusion_query(
     }
     let (query_set, _) = &active_query.insert((query_set, query_index));
 
-    unsafe {
-        // If we don't have a reset state tracker which can defer resets, we must reset now.
-        if needs_reset {
-            raw_encoder.reset_queries(
-                query_set.try_raw(snatch_guard)?,
-                query_index..(query_index + 1),
-            );
-        }
-        raw_encoder.begin_query(query_set.try_raw(snatch_guard)?, query_index);
+    query_set.try_raw(snatch_guard)?;
+    // If we don't have a reset state tracker which can defer resets, we must reset now.
+    if needs_reset {
+        recorder.reset_queries(query_set, query_index..(query_index + 1));
     }
+    recorder.begin_query(query_set, query_index);
 
     Ok(())
 }
 
 pub(super) fn end_occlusion_query(
-    raw_encoder: &mut dyn hal::DynCommandEncoder,
+    recorder: &mut PassRecorder,
     active_query: &mut Option<(Arc<QuerySet>, u32)>,
     snatch_guard: &SnatchGuard<'_>,
     query_set_writes: &mut QuerySetWrites,
 ) -> Result<(), QueryUseError> {
     if let Some((query_set, query_index)) = active_query.take() {
-        unsafe { raw_encoder.end_query(query_set.try_raw(snatch_guard)?, query_index) };
+        query_set.try_raw(snatch_guard)?;
+        recorder.end_query(&query_set, query_index);
         record_query_write(query_set_writes, &query_set, query_index);
         Ok(())
     } else {
@@ -371,7 +394,7 @@ pub(super) fn end_occlusion_query(
 
 pub(super) fn validate_and_begin_pipeline_statistics_query(
     query_set: Arc<QuerySet>,
-    raw_encoder: &mut dyn hal::DynCommandEncoder,
+    recorder: &mut PassRecorder,
     tracker: &mut QuerySetTracker,
     device: &Arc<Device>,
     query_index: u32,
@@ -398,28 +421,25 @@ pub(super) fn validate_and_begin_pipeline_statistics_query(
     }
     let (query_set, _) = &active_query.insert((query_set, query_index));
 
-    unsafe {
-        // If we don't have a reset state tracker which can defer resets, we must reset now.
-        if needs_reset {
-            raw_encoder.reset_queries(
-                query_set.try_raw(snatch_guard)?,
-                query_index..(query_index + 1),
-            );
-        }
-        raw_encoder.begin_query(query_set.try_raw(snatch_guard)?, query_index);
+    query_set.try_raw(snatch_guard)?;
+    // If we don't have a reset state tracker which can defer resets, we must reset now.
+    if needs_reset {
+        recorder.reset_queries(query_set, query_index..(query_index + 1));
     }
+    recorder.begin_query(query_set, query_index);
 
     Ok(())
 }
 
 pub(super) fn end_pipeline_statistics_query(
-    raw_encoder: &mut dyn hal::DynCommandEncoder,
+    recorder: &mut PassRecorder,
     active_query: &mut Option<(Arc<QuerySet>, u32)>,
     snatch_guard: &SnatchGuard<'_>,
     query_set_writes: &mut QuerySetWrites,
 ) -> Result<(), QueryUseError> {
     if let Some((query_set, query_index)) = active_query.take() {
-        unsafe { raw_encoder.end_query(query_set.try_raw(snatch_guard)?, query_index) };
+        query_set.try_raw(snatch_guard)?;
+        recorder.end_query(&query_set, query_index);
         record_query_write(query_set_writes, &query_set, query_index);
         Ok(())
     } else {

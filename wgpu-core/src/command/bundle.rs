@@ -1286,6 +1286,75 @@ impl RenderBundle {
         self.base.clone()
     }
 
+    /// Checks that the bundle's resources are not destroyed and adds its
+    /// indirect draws to the validation batch, returning their destination
+    /// (resource index, offset) for [`Self::execute`].
+    pub(super) fn validate_indirect_draws(
+        &self,
+        indirect_draw_validation_resources: &mut crate::indirect_validation::DrawResources,
+        indirect_draw_validation_batcher: &mut crate::indirect_validation::DrawBatcher,
+        snatch_guard: &SnatchGuard,
+    ) -> Result<Vec<(usize, wgt::BufferAddress)>, ExecutionError> {
+        use ArcRenderCommand as Cmd;
+        let mut validated_draws = Vec::new();
+        for command in self.base.commands.iter() {
+            match command {
+                Cmd::SetBindGroup { bind_group, .. } => {
+                    bind_group.as_ref().unwrap().try_raw(snatch_guard)?;
+                }
+                Cmd::SetIndexBuffer { buffer, .. } => {
+                    buffer.try_raw(snatch_guard)?;
+                }
+                Cmd::SetVertexBuffer { buffer, .. } => {
+                    buffer.as_ref().unwrap().try_raw(snatch_guard)?;
+                }
+                Cmd::DrawIndirect {
+                    buffer,
+                    offset,
+                    count: 1,
+                    family,
+                    vertex_or_index_limit,
+                    instance_limit,
+                } => {
+                    buffer.try_raw(snatch_guard)?;
+                    if self.device.indirect_validation.is_some()
+                        && *family != DrawCommandFamily::DrawMeshTasks
+                    {
+                        validated_draws.push(
+                            indirect_draw_validation_batcher.add(
+                                indirect_draw_validation_resources,
+                                &self.device,
+                                buffer,
+                                *offset,
+                                *family,
+                                vertex_or_index_limit.expect(
+                                    "finalized render bundle missing vertex_or_index_limit",
+                                ),
+                                instance_limit
+                                    .expect("finalized render bundle missing instance_limit"),
+                            )?,
+                        );
+                    }
+                }
+                Cmd::DrawIndirect { .. } | Cmd::MultiDrawIndirectCount { .. } => {
+                    return Err(ExecutionError::Unimplemented("multi-draw-indirect"))
+                }
+                Cmd::PushDebugGroup { .. } | Cmd::InsertDebugMarker { .. } | Cmd::PopDebugGroup => {
+                    return Err(ExecutionError::Unimplemented("debug-markers"))
+                }
+                Cmd::WriteTimestamp { .. }
+                | Cmd::BeginOcclusionQuery { .. }
+                | Cmd::EndOcclusionQuery
+                | Cmd::BeginPipelineStatisticsQuery { .. }
+                | Cmd::EndPipelineStatisticsQuery => {
+                    return Err(ExecutionError::Unimplemented("queries"))
+                }
+                _ => {}
+            }
+        }
+        Ok(validated_draws)
+    }
+
     /// Actually encode the contents into a native command buffer.
     ///
     /// This is partially duplicating the logic of `render_pass_end`.
@@ -1293,15 +1362,16 @@ impl RenderBundle {
     /// a chance to go through the commands in `render_bundle_encoder_finish`.
     ///
     /// Note that the function isn't expected to fail, generally.
-    /// All the validation has already been done by this point.
-    /// The only failure condition is if some of the used buffers are destroyed.
+    /// All the validation has already been done by this point, including
+    /// [`Self::validate_indirect_draws`].
     pub(super) unsafe fn execute(
         &self,
         raw: &mut dyn hal::DynCommandEncoder,
-        indirect_draw_validation_resources: &mut crate::indirect_validation::DrawResources,
-        indirect_draw_validation_batcher: &mut crate::indirect_validation::DrawBatcher,
+        indirect_draw_validation_resources: &crate::indirect_validation::DrawResources,
+        validated_draws: &[(usize, wgt::BufferAddress)],
         snatch_guard: &SnatchGuard,
     ) -> Result<(), ExecutionError> {
+        let mut validated_draws = validated_draws.iter();
         let mut offsets = self.base.dynamic_offsets.as_slice();
         let mut pipeline_layout = None::<Arc<PipelineLayout>>;
         if !self.discard_hal_labels {
@@ -1457,23 +1527,14 @@ impl RenderBundle {
                     offset,
                     count: 1,
                     family,
-
-                    vertex_or_index_limit,
-                    instance_limit,
+                    ..
                 } => {
                     let (buffer, offset) = if self.device.indirect_validation.is_some()
                         && *family != DrawCommandFamily::DrawMeshTasks
                     {
-                        let (dst_resource_index, offset) = indirect_draw_validation_batcher.add(
-                            indirect_draw_validation_resources,
-                            &self.device,
-                            buffer,
-                            *offset,
-                            *family,
-                            vertex_or_index_limit
-                                .expect("finalized render bundle missing vertex_or_index_limit"),
-                            instance_limit.expect("finalized render bundle missing instance_limit"),
-                        )?;
+                        let &(dst_resource_index, offset) = validated_draws
+                            .next()
+                            .expect("indirect draws were validated");
 
                         let dst_buffer =
                             indirect_draw_validation_resources.get_dst_buffer(dst_resource_index);

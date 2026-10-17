@@ -5,7 +5,7 @@ use wgt::{
     BufferAddress, DynamicOffset,
 };
 
-use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{convert::Infallible, fmt, str};
 
 use crate::{
@@ -17,7 +17,9 @@ use crate::{
         encoder::EncodingState,
         memory_init::{fixup_discarded_surfaces, SurfacesInDiscardState},
         pass::{self, flush_bindings_helper},
-        pass_base, pass_try,
+        pass_base,
+        pass_recorder::{PassRecorder, RecordedBuffer, RecordedTimestampWrites},
+        pass_try,
         query::{
             end_pipeline_statistics_query, record_pass_timestamp_writes,
             validate_and_begin_pipeline_statistics_query,
@@ -214,6 +216,19 @@ pub struct ComputePassError {
     pub(super) inner: ComputePassErrorInner,
 }
 
+impl From<resource::InvalidOrDestroyedResourceError> for ComputePassErrorInner {
+    fn from(e: resource::InvalidOrDestroyedResourceError) -> Self {
+        match e {
+            resource::InvalidOrDestroyedResourceError::InvalidResource(e) => {
+                Self::InvalidResource(e)
+            }
+            resource::InvalidOrDestroyedResourceError::DestroyedResource(e) => {
+                Self::DestroyedResource(e)
+            }
+        }
+    }
+}
+
 impl From<pass::MissingPipeline> for ComputePassErrorInner {
     fn from(value: pass::MissingPipeline) -> Self {
         Self::Dispatch(DispatchError::MissingPipeline(value))
@@ -382,10 +397,9 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
 
         flush_bindings_helper(&mut self.pass)?;
 
-        CommandEncoder::drain_barriers(
+        CommandEncoder::record_barriers(
             self.pass.base.raw_encoder,
             &mut self.intermediate_trackers,
-            self.pass.base.snatch_guard,
         );
         Ok(())
     }
@@ -447,10 +461,9 @@ fn transition_resources(
         .set_and_remove_from_usage_scope_sparse(&mut state.pass.scope.textures, &textures);
 
     // Record any needed barriers based on tracker data
-    CommandEncoder::drain_barriers(
+    CommandEncoder::record_barriers(
         state.pass.base.raw_encoder,
         &mut state.intermediate_trackers,
-        state.pass.base.snatch_guard,
     );
     Ok(())
 }
@@ -663,17 +676,8 @@ pub(super) fn encode_compute_pass(
 
     let device = parent_state.device;
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    let mut recorder = PassRecorder::new();
+    let raw_encoder = &mut recorder;
 
     let mut debug_scope_depth = 0;
 
@@ -728,7 +732,7 @@ pub(super) fn encode_compute_pass(
         .textures
         .set_size(indices.textures.size());
 
-    let timestamp_writes: Option<hal::PassTimestampWrites<'_, dyn hal::DynQuerySet>> =
+    let timestamp_writes: Option<RecordedTimestampWrites> =
         if let Some(tw) = timestamp_writes.take() {
             tw.query_set.same_device(device).map_pass_err(pass_scope)?;
 
@@ -752,23 +756,18 @@ pub(super) fn encode_compute_pass(
                     .or(tw.end_of_pass_write_index)
                     .map(|i| i..i + 1)
             };
-            let raw_query_set = query_set
+            query_set
                 .try_raw(parent_state.snatch_guard)
                 .map_pass_err(pass_scope)?;
+            let query_set = query_set.clone();
             // Range should always be Some, both values being None should lead to a validation error.
             // But no point in erroring over that nuance here!
             if let Some(range) = range {
-                unsafe {
-                    state
-                        .pass
-                        .base
-                        .raw_encoder
-                        .reset_queries(raw_query_set, range);
-                }
+                state.pass.base.raw_encoder.reset_queries(&query_set, range);
             }
 
-            Some(hal::PassTimestampWrites {
-                query_set: raw_query_set,
+            Some(RecordedTimestampWrites {
+                query_set,
                 beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
                 end_of_pass_write_index: tw.end_of_pass_write_index,
             })
@@ -776,14 +775,10 @@ pub(super) fn encode_compute_pass(
             None
         };
 
-    let hal_desc = hal::ComputePassDescriptor {
-        label: hal_label(base.label.as_deref(), device.instance_flags),
+    state.pass.base.raw_encoder.begin_compute_pass(
+        hal_label(base.label.as_deref(), device.instance_flags).map(String::from),
         timestamp_writes,
-    };
-
-    unsafe {
-        state.pass.base.raw_encoder.begin_compute_pass(&hal_desc);
-    }
+    );
 
     for command in base.commands.drain(..) {
         match command {
@@ -911,9 +906,7 @@ pub(super) fn encode_compute_pass(
         )?;
     }
 
-    unsafe {
-        state.pass.base.raw_encoder.end_compute_pass();
-    }
+    state.pass.base.raw_encoder.end_compute_pass();
 
     let State {
         pass: pass::PassState {
@@ -924,18 +917,9 @@ pub(super) fn encode_compute_pass(
         ..
     } = state;
 
-    // Stop the current command encoder.
-    parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
-
-    // Create a new command encoder, which we will insert _before_ the body of the compute pass.
-    //
-    // Use that buffer to insert barriers and clear discarded images.
     let transit = parent_state
         .raw_encoder
-        .open_pass(hal_label(
-            Some("(wgpu internal) Pre Pass"),
-            device.instance_flags,
-        ))
+        .open_if_closed()
         .map_pass_err(pass_scope)?;
     fixup_discarded_surfaces(
         pending_discard_init_fixups.into_iter(),
@@ -950,10 +934,13 @@ pub(super) fn encode_compute_pass(
         &intermediate_trackers,
         parent_state.snatch_guard,
     );
-    // Close the command encoder, and swap it with the previous.
-    parent_state
-        .raw_encoder
-        .close_and_swap()
+    recorder
+        .encode::<ComputePassErrorInner>(
+            transit,
+            device,
+            parent_state.indirect_draw_validation_resources,
+            parent_state.snatch_guard,
+        )
         .map_pass_err(pass_scope)?;
 
     Ok(())
@@ -976,13 +963,8 @@ fn set_pipeline(
         .insert_single(pipeline)
         .clone();
 
-    unsafe {
-        state
-            .pass
-            .base
-            .raw_encoder
-            .set_compute_pipeline(pipeline.raw()?);
-    }
+    pipeline.raw()?;
+    state.pass.base.raw_encoder.set_compute_pipeline(&pipeline);
 
     // Rebind resources
     let pipeline_layout = pipeline.layout()?;
@@ -1028,9 +1010,7 @@ fn dispatch_workgroups(state: &mut State, groups: [u32; 3]) -> Result<(), Comput
         ));
     }
 
-    unsafe {
-        state.pass.base.raw_encoder.dispatch_workgroups(groups);
-    }
+    state.pass.base.raw_encoder.dispatch_workgroups(groups);
     Ok(())
 }
 
@@ -1078,153 +1058,85 @@ fn dispatch_workgroups_indirect(
         ),
     );
 
-    if let Some(ref indirect_validation) = state.pass.base.device.indirect_validation {
-        let params = indirect_validation.dispatch.params(
-            &state.pass.base.device.limits,
-            offset,
-            buffer.size,
-        );
-
-        unsafe {
-            state
-                .pass
-                .base
-                .raw_encoder
-                .set_compute_pipeline(params.pipeline);
-        }
-
-        unsafe {
-            state.pass.base.raw_encoder.set_immediates(
-                params.pipeline_layout,
-                0,
-                &[params.offset_remainder as u32 / 4],
-            );
-        }
-
-        unsafe {
-            state.pass.base.raw_encoder.set_bind_group(
-                params.pipeline_layout,
-                0,
-                params.dst_bind_group,
-                &[],
-            );
-        }
-        unsafe {
-            state.pass.base.raw_encoder.set_bind_group(
-                params.pipeline_layout,
-                1,
-                buffer
-                    .indirect_validation_bind_groups
-                    .get(state.pass.base.snatch_guard)
-                    .unwrap()
-                    .dispatch
-                    .as_ref(),
-                &[params.aligned_offset as u32],
-            );
-        }
+    if state.pass.base.device.indirect_validation.is_some() {
+        buffer
+            .indirect_validation_bind_groups
+            .get(state.pass.base.snatch_guard)
+            .ok_or_else(|| DestroyedResourceError(buffer.error_ident()))?;
+        state
+            .pass
+            .base
+            .raw_encoder
+            .set_dispatch_validation(&buffer, offset);
 
         let src_transition = state
             .intermediate_trackers
             .buffers
             .set_single(&buffer, wgt::BufferUses::STORAGE_READ_ONLY);
-        let src_barrier = src_transition
-            .map(|transition| transition.into_hal(&buffer, state.pass.base.snatch_guard));
-        unsafe {
-            state
-                .pass
-                .base
-                .raw_encoder
-                .transition_buffers(src_barrier.as_slice());
-        }
+        state.pass.base.raw_encoder.transition_buffers(
+            src_transition
+                .map(|transition| (RecordedBuffer::Buffer(buffer.clone()), transition.usage)),
+        );
 
-        unsafe {
-            state
-                .pass
-                .base
-                .raw_encoder
-                .transition_buffers(&[hal::BufferBarrier {
-                    buffer: params.dst_buffer,
-                    usage: hal::StateTransition {
-                        from: wgt::BufferUses::INDIRECT,
-                        to: wgt::BufferUses::STORAGE_READ_WRITE,
-                    },
-                }]);
-        }
+        state.pass.base.raw_encoder.transition_buffers([(
+            RecordedBuffer::DispatchValidation,
+            hal::StateTransition {
+                from: wgt::BufferUses::INDIRECT,
+                to: wgt::BufferUses::STORAGE_READ_WRITE,
+            },
+        )]);
 
-        unsafe {
-            state.pass.base.raw_encoder.dispatch_workgroups([1, 1, 1]);
-        }
+        state.pass.base.raw_encoder.dispatch_workgroups([1, 1, 1]);
 
         // reset state
         {
             let pipeline = state.pipeline.as_ref().unwrap();
+            pipeline.raw()?;
+            state.pass.base.raw_encoder.set_compute_pipeline(pipeline);
 
-            unsafe {
+            let pipeline_layout = pipeline.layout()?;
+            if !state.immediates.is_empty() {
+                pipeline_layout.raw()?;
                 state
                     .pass
                     .base
                     .raw_encoder
-                    .set_compute_pipeline(pipeline.raw()?);
-            }
-
-            let pipeline_layout = pipeline.layout()?;
-
-            if !state.immediates.is_empty() {
-                unsafe {
-                    state.pass.base.raw_encoder.set_immediates(
-                        pipeline_layout.raw()?,
-                        0,
-                        &state.immediates,
-                    );
-                }
+                    .set_immediates(pipeline_layout, 0, &state.immediates);
             }
 
             for (i, group, dynamic_offsets) in state.pass.binder.list_valid() {
-                let raw_bg = group.try_raw(state.pass.base.snatch_guard)?;
-                unsafe {
-                    state.pass.base.raw_encoder.set_bind_group(
-                        pipeline_layout.raw()?,
-                        i as u32,
-                        raw_bg,
-                        dynamic_offsets,
-                    );
-                }
+                group.try_raw(state.pass.base.snatch_guard)?;
+                state.pass.base.raw_encoder.set_bind_group(
+                    pipeline_layout,
+                    i as u32,
+                    group,
+                    dynamic_offsets,
+                );
             }
         }
 
-        unsafe {
-            state
-                .pass
-                .base
-                .raw_encoder
-                .transition_buffers(&[hal::BufferBarrier {
-                    buffer: params.dst_buffer,
-                    usage: hal::StateTransition {
-                        from: wgt::BufferUses::STORAGE_READ_WRITE,
-                        to: wgt::BufferUses::INDIRECT,
-                    },
-                }]);
-        }
+        state.pass.base.raw_encoder.transition_buffers([(
+            RecordedBuffer::DispatchValidation,
+            hal::StateTransition {
+                from: wgt::BufferUses::STORAGE_READ_WRITE,
+                to: wgt::BufferUses::INDIRECT,
+            },
+        )]);
 
         state.flush_bindings(Some(&buffer), false)?;
-        unsafe {
-            state
-                .pass
-                .base
-                .raw_encoder
-                .dispatch_workgroups_indirect(params.dst_buffer, 0);
-        }
+        state
+            .pass
+            .base
+            .raw_encoder
+            .dispatch_workgroups_indirect(RecordedBuffer::DispatchValidation, 0);
     } else {
         state.flush_bindings(Some(&buffer), true)?;
-
-        let buf_raw = buffer.try_raw(state.pass.base.snatch_guard)?;
-        unsafe {
-            state
-                .pass
-                .base
-                .raw_encoder
-                .dispatch_workgroups_indirect(buf_raw, offset);
-        }
+        buffer.try_raw(state.pass.base.snatch_guard)?;
+        state
+            .pass
+            .base
+            .raw_encoder
+            .dispatch_workgroups_indirect(RecordedBuffer::Buffer(buffer), offset);
     }
 
     Ok(())
