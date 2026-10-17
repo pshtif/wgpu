@@ -11,6 +11,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         DROP_QUEUE_BEFORE_CREATING_COMMAND_ENCODER,
         DROP_ENCODER_AFTER_ERROR,
         ENCODER_OPERATIONS_FAIL_WHILE_PASS_ALIVE,
+        MANY_PASSES_IN_ONE_ENCODER,
     ]);
 }
 
@@ -343,3 +344,184 @@ fn encoder_operations_fail_while_pass_alive(ctx: TestingContext) {
         }
     }
 }
+
+/// More passes than Metal allows command buffers to be outstanding, each
+/// depending on the one before it.
+#[apply(gpu_test!)]
+static MANY_PASSES_IN_ONE_ENCODER: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(TestParameters::default().test_features_limits())
+    .run_async(|ctx| async move {
+        const ITERATIONS: u32 = 2100;
+
+        let compute_module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
+                    @group(0) @binding(0) var<storage, read_write> counter: u32;
+
+                    @compute @workgroup_size(1)
+                    fn main() {
+                        counter += 1u;
+                    }
+                    "#
+                    .into(),
+                ),
+            });
+        let render_module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
+                    @group(0) @binding(0) var<storage, read> counter: u32;
+
+                    @vertex
+                    fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+                        let uv = vec2f(f32((index << 1u) & 2u), f32(index & 2u));
+                        return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
+                    }
+
+                    @fragment
+                    fn fs_main() -> @location(0) u32 {
+                        return counter;
+                    }
+                    "#
+                    .into(),
+                ),
+            });
+
+        let counter = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Uint,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 512,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let compute_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: None,
+                    module: &compute_module,
+                    entry_point: None,
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+        let render_pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &render_module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &render_module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::TextureFormat::R32Uint.into())],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let compute_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &compute_pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: counter.as_entire_binding(),
+            }],
+        });
+        let render_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &render_pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: counter.as_entire_binding(),
+            }],
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.clear_buffer(&counter, 0, None);
+        for _ in 0..ITERATIONS {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                pass.set_pipeline(&compute_pipeline);
+                pass.set_bind_group(0, &compute_bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations::default(),
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&render_pipeline);
+            pass.set_bind_group(0, &render_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_buffer_to_buffer(&counter, 0, &readback, 0, 4);
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 256,
+                    bytes_per_row: None,
+                    rows_per_image: None,
+                },
+            },
+            target.size(),
+        );
+        ctx.queue.submit([encoder.finish()]);
+
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        ctx.async_poll(wgpu::PollType::wait_indefinitely())
+            .await
+            .unwrap();
+        let data = readback.slice(..).get_mapped_range().unwrap();
+        let counter_value: u32 = *bytemuck::from_bytes(&data[0..4]);
+        let target_value: u32 = *bytemuck::from_bytes(&data[256..260]);
+        assert_eq!(counter_value, ITERATIONS);
+        assert_eq!(target_value, ITERATIONS);
+    });

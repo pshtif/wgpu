@@ -33,7 +33,6 @@ pub(crate) struct Dispatch {
 pub struct Params<'a> {
     pub pipeline_layout: &'a dyn hal::DynPipelineLayout,
     pub pipeline: &'a dyn hal::DynComputePipeline,
-    pub dst_buffer: &'a dyn hal::DynBuffer,
     pub dst_bind_group: &'a dyn hal::DynBindGroup,
     pub aligned_offset: u64,
     pub offset_remainder: u64,
@@ -335,6 +334,11 @@ impl Dispatch {
         }
     }
 
+    /// The buffer that validated dispatches read their arguments from.
+    pub(crate) fn dst_buffer(&self) -> &dyn hal::DynBuffer {
+        self.dst_buffer.as_ref()
+    }
+
     pub fn params<'a>(&'a self, limits: &wgt::Limits, offset: u64, buffer_size: u64) -> Params<'a> {
         // The offset we receive is only required to be aligned to 4 bytes.
         //
@@ -361,7 +365,6 @@ impl Dispatch {
         Params {
             pipeline_layout: self.pipeline_layout.as_ref(),
             pipeline: self.pipeline.as_ref(),
-            dst_buffer: self.dst_buffer.as_ref(),
             dst_bind_group: self.dst_bind_group.as_ref(),
             aligned_offset,
             offset_remainder,

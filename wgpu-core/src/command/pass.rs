@@ -3,8 +3,8 @@
 use crate::binding_model::{BindError, BindGroup, ImmediateUploadError};
 use crate::command::encoder::EncodingState;
 use crate::command::{
-    bind::Binder, memory_init::SurfacesInDiscardState, query::QueryResetMap, DebugGroupError,
-    QueryUseError,
+    bind::Binder, memory_init::SurfacesInDiscardState, pass_recorder::PassRecorder,
+    query::QueryResetMap, DebugGroupError, QueryUseError,
 };
 use crate::device::{Device, DeviceError, MissingFeatures};
 use crate::pipeline::LateSizedBufferGroup;
@@ -85,27 +85,25 @@ impl ImmediateState {
     pub(crate) fn flush_immediates(
         &mut self,
         layout: &Arc<binding_model::PipelineLayout>,
-        raw_encoder: &mut dyn hal::DynCommandEncoder,
+        recorder: &mut PassRecorder,
     ) {
         if !self.immediates.is_empty() && self.immediates_dirty {
-            // SAFETY: The range of immediates written is within layout immediate size.
-            unsafe {
-                raw_encoder.set_immediates(
-                    layout.raw().unwrap(),
-                    0,
-                    &self.immediates[..(self
-                        .immediates
-                        .len()
-                        .min(layout.immediate_size as usize / size_of::<u32>()))],
-                );
-            }
+            // The range of immediates written is within layout immediate size.
+            recorder.set_immediates(
+                layout,
+                0,
+                &self.immediates[..(self
+                    .immediates
+                    .len()
+                    .min(layout.immediate_size as usize / size_of::<u32>()))],
+            );
             self.immediates_dirty = false;
         }
     }
 }
 
 pub(crate) struct PassState<'scope, 'snatch_guard, 'cmd_enc> {
-    pub(crate) base: EncodingState<'snatch_guard, 'cmd_enc>,
+    pub(crate) base: EncodingState<'snatch_guard, 'cmd_enc, PassRecorder>,
 
     /// Immediate texture inits required because of prior discards. Need to
     /// be inserted before texture reads.
@@ -240,17 +238,13 @@ pub(super) fn flush_bindings_helper(
 
         state.base.as_actions.extend(used_resource);
 
-        let raw_bg = bind_group.try_raw(state.base.snatch_guard)?;
-        unsafe {
-            state.base.raw_encoder.set_bind_group(
-                pipeline_layout
-                    .raw()
-                    .expect("Pipeline layout should be valid at this point"),
-                i as u32,
-                raw_bg,
-                dynamic_offsets,
-            );
-        }
+        bind_group.try_raw(state.base.snatch_guard)?;
+        state.base.raw_encoder.set_bind_group(
+            pipeline_layout,
+            i as u32,
+            bind_group,
+            dynamic_offsets,
+        );
     }
 
     Ok(())
@@ -312,7 +306,7 @@ where
 
     let query_set = state.base.tracker.query_sets.insert_single(query_set);
 
-    query_set.validate_and_write_timestamp(
+    query_set.validate_and_record_timestamp(
         state.base.raw_encoder,
         query_index,
         pending_query_resets,
@@ -334,9 +328,7 @@ pub(crate) fn push_debug_group(state: &mut PassState, string_data: &[u8], len: u
             str::from_utf8(&string_data[state.string_offset..state.string_offset + len]).unwrap();
 
         api_log!("Pass::push_debug_group {label:?}");
-        unsafe {
-            state.base.raw_encoder.begin_debug_marker(label);
-        }
+        state.base.raw_encoder.begin_debug_marker(label);
     }
     state.string_offset += len;
 }
@@ -357,9 +349,7 @@ where
         .instance_flags
         .contains(wgt::InstanceFlags::DISCARD_HAL_LABELS)
     {
-        unsafe {
-            state.base.raw_encoder.end_debug_marker();
-        }
+        state.base.raw_encoder.end_debug_marker();
     }
     Ok(())
 }
@@ -374,9 +364,7 @@ pub(crate) fn insert_debug_marker(state: &mut PassState, string_data: &[u8], len
         let label =
             str::from_utf8(&string_data[state.string_offset..state.string_offset + len]).unwrap();
         api_log!("Pass::insert_debug_marker {label:?}");
-        unsafe {
-            state.base.raw_encoder.insert_debug_marker(label);
-        }
+        state.base.raw_encoder.insert_debug_marker(label);
     }
     state.string_offset += len;
 }

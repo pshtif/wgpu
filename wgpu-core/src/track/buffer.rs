@@ -349,6 +349,16 @@ impl BufferTracker {
         buffer_barriers
     }
 
+    /// Drains all currently pending transitions, with the buffers they apply to.
+    pub fn drain_transitions_with_buffers(
+        &mut self,
+    ) -> impl Iterator<Item = (Arc<Buffer>, PendingTransition<BufferUses>)> + '_ {
+        self.temp.drain(..).map(|pending| {
+            let buf = unsafe { self.metadata.get_resource_unchecked(pending.id as _) };
+            (buf.clone(), pending)
+        })
+    }
+
     /// Sets the state of a single buffer.
     ///
     /// If a transition is needed to get the buffer into the given state, that transition

@@ -526,6 +526,16 @@ impl TextureTracker {
         (transitions, textures)
     }
 
+    /// Drain all currently pending transitions, with the textures they apply to.
+    pub fn drain_transitions_with_textures(
+        &mut self,
+    ) -> impl Iterator<Item = (Arc<Texture>, PendingTransition<TextureUses>)> + '_ {
+        self.temp.drain(..).map(|pending| {
+            let tex = unsafe { self.metadata.get_resource_unchecked(pending.id as _) };
+            (tex.clone(), pending)
+        })
+    }
+
     /// Sets the state of a single texture.
     ///
     /// If a transition is needed to get the texture into the given state, that transition

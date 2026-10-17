@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{convert::Infallible, fmt, num::NonZeroU32, ops::Range, str};
 use smallvec::SmallVec;
 
@@ -18,7 +18,13 @@ use crate::{
         draw::validate_mesh_draw_multiview,
         memory_init::{fixup_discarded_surfaces, SurfacesInDiscardState, TextureSurfaceDiscard},
         pass::{self, flush_bindings_helper, ImmediateState},
-        pass_base, pass_try,
+        pass_base,
+        pass_recorder::{
+            IndirectDrawKind, PassRecorder, RecordedAttachment, RecordedBuffer,
+            RecordedColorAttachment, RecordedDepthStencilAttachment, RecordedRenderPass,
+            RecordedTimestampWrites,
+        },
+        pass_try,
         query::{
             end_occlusion_query, end_pipeline_statistics_query, record_pass_timestamp_writes,
             validate_and_begin_occlusion_query, validate_and_begin_pipeline_statistics_query,
@@ -749,7 +755,7 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
     /// Flush dirty vertex buffer slots to the HAL encoder in preparation for a draw call.
     fn flush_vertex_buffers(&mut self) -> Result<(), RenderPassErrorInner> {
         let vertex = &mut self.vertex;
-        let raw_encoder: &mut dyn hal::DynCommandEncoder = self.pass.base.raw_encoder;
+        let recorder: &mut PassRecorder = self.pass.base.raw_encoder;
         let snatch_guard = self.pass.base.snatch_guard;
         let mut result = Ok(());
         vertex.flush(|slot, buffer, offset, size| {
@@ -757,13 +763,8 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
                 return;
             }
             match buffer.try_raw(snatch_guard) {
-                Ok(raw) => unsafe {
-                    // SAFETY: The offset and size were validated in set_vertex_buffer.
-                    raw_encoder.set_vertex_buffer(
-                        slot,
-                        hal::BufferBinding::new_unchecked(raw, offset, size),
-                    );
-                },
+                // The offset and size were validated in set_vertex_buffer.
+                Ok(_) => recorder.set_vertex_buffer(slot, buffer, offset, size),
                 Err(e) => result = Err(e.into()),
             }
         });
@@ -1225,7 +1226,7 @@ impl RenderPassInfo {
         >,
         mut timestamp_writes: Option<PassTimestampWrites>,
         mut occlusion_query_set: Option<Arc<QuerySet>>,
-        encoder: &mut dyn hal::DynCommandEncoder,
+        recorder: &mut PassRecorder,
         trackers: &mut Tracker,
         texture_memory_actions: &mut CommandBufferTextureMemoryActions,
         pending_query_resets: &mut QueryResetMap,
@@ -1458,9 +1459,10 @@ impl RenderPassInfo {
             };
             render_attachments.push(view.to_render_attachment(usage));
 
-            depth_stencil = Some(hal::DepthStencilAttachment {
-                target: hal::Attachment {
-                    view: view.try_raw(snatch_guard)?,
+            view.try_raw(snatch_guard)?;
+            depth_stencil = Some(RecordedDepthStencilAttachment {
+                target: RecordedAttachment {
+                    view: view.clone(),
                     usage,
                 },
                 depth_ops: at.depth.hal_ops(),
@@ -1473,8 +1475,7 @@ impl RenderPassInfo {
 
         let mut attachment_set = crate::FastHashSet::default();
 
-        let mut color_attachments_hal =
-            ArrayVec::<Option<hal::ColorAttachment<_>>, { hal::MAX_COLOR_ATTACHMENTS }>::new();
+        let mut color_attachments_hal = Vec::with_capacity(color_attachments.len());
         for (index, attachment) in color_attachments.iter().enumerate() {
             let at = if let Some(attachment) = attachment.as_ref() {
                 attachment
@@ -1659,15 +1660,17 @@ impl RenderPassInfo {
                 render_attachments
                     .push(resolve_view.to_render_attachment(wgt::TextureUses::COLOR_TARGET));
 
-                hal_resolve_target = Some(hal::Attachment {
-                    view: resolve_view.try_raw(snatch_guard)?,
+                resolve_view.try_raw(snatch_guard)?;
+                hal_resolve_target = Some(RecordedAttachment {
+                    view: resolve_view.clone(),
                     usage: wgt::TextureUses::COLOR_TARGET,
                 });
             }
 
-            color_attachments_hal.push(Some(hal::ColorAttachment {
-                target: hal::Attachment {
-                    view: color_view.try_raw(snatch_guard)?,
+            color_view.try_raw(snatch_guard)?;
+            color_attachments_hal.push(Some(RecordedColorAttachment {
+                target: RecordedAttachment {
+                    view: at.view.clone(),
                     usage: wgt::TextureUses::COLOR_TARGET,
                 },
                 depth_slice: at.depth_slice,
@@ -1732,8 +1735,9 @@ impl RenderPassInfo {
 
             record_pass_timestamp_writes(tw, query_set_writes);
 
-            Some(hal::PassTimestampWrites {
-                query_set: query_set.try_raw(snatch_guard)?,
+            query_set.try_raw(snatch_guard)?;
+            Some(RecordedTimestampWrites {
+                query_set: query_set.clone(),
                 beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
                 end_of_pass_write_index: tw.end_of_pass_write_index,
             })
@@ -1743,29 +1747,23 @@ impl RenderPassInfo {
 
         let occlusion_query_set_hal = if let Some(query_set) = occlusion_query_set.as_ref() {
             query_set.same_device(device)?;
-            Some(query_set.try_raw(snatch_guard)?)
+            query_set.try_raw(snatch_guard)?;
+            Some(query_set.clone())
         } else {
             None
         };
 
-        let hal_desc = hal::RenderPassDescriptor {
-            label: hal_label,
+        recorder.begin_render_pass(RecordedRenderPass {
+            label: hal_label.map(String::from),
             extent,
             sample_count,
-            color_attachments: &color_attachments_hal,
+            color_attachments: color_attachments_hal,
             depth_stencil_attachment: depth_stencil,
             multiview_mask,
             timestamp_writes: timestamp_writes_hal,
             occlusion_query_set: occlusion_query_set_hal,
-        };
-        unsafe {
-            encoder
-                .begin_render_pass(&hal_desc)
-                .map_err(|e| device.handle_hal_error(e))?;
-        };
-        drop(color_attachments_hal); // Drop, so we can consume `color_attachments` for the tracker.
+        });
 
-        // Can't borrow the tracker more than once, so have to add to the tracker after the `begin_render_pass` hal call.
         if let Some(tw) = timestamp_writes.take() {
             trackers.query_sets.insert_single(tw.query_set);
         };
@@ -1795,16 +1793,13 @@ impl RenderPassInfo {
 
     fn finish(
         self,
-        device: &Device,
-        raw: &mut dyn hal::DynCommandEncoder,
+        recorder: &mut PassRecorder,
         snatch_guard: &SnatchGuard,
         scope: &mut UsageScope<'_>,
         instance_flags: InstanceFlags,
     ) -> Result<(), RenderPassErrorInner> {
         profiling::scope!("RenderPassInfo::finish");
-        unsafe {
-            raw.end_render_pass();
-        }
+        recorder.end_render_pass();
 
         for ra in self.render_attachments {
             let texture = &ra.texture;
@@ -1836,17 +1831,19 @@ impl RenderPassInfo {
                     hal::AttachmentOps::LOAD_CLEAR | hal::AttachmentOps::STORE, // clear depth
                 )
             };
-            let desc = hal::RenderPassDescriptor::<'_, _, dyn hal::DynTextureView> {
+            view.try_raw(snatch_guard)?;
+            let desc = RecordedRenderPass {
                 label: hal_label(
                     Some("(wgpu internal) Zero init discarded depth/stencil aspect"),
                     instance_flags,
-                ),
+                )
+                .map(String::from),
                 extent: view.state()?.render_extent.unwrap(),
                 sample_count: view.samples,
-                color_attachments: &[],
-                depth_stencil_attachment: Some(hal::DepthStencilAttachment {
-                    target: hal::Attachment {
-                        view: view.try_raw(snatch_guard)?,
+                color_attachments: Vec::new(),
+                depth_stencil_attachment: Some(RecordedDepthStencilAttachment {
+                    target: RecordedAttachment {
+                        view: view.clone(),
                         usage: wgt::TextureUses::DEPTH_WRITE | wgt::TextureUses::STENCIL_WRITE,
                     },
                     depth_ops,
@@ -1859,11 +1856,8 @@ impl RenderPassInfo {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             };
-            unsafe {
-                raw.begin_render_pass(&desc)
-                    .map_err(|e| device.handle_hal_error(e))?;
-                raw.end_render_pass();
-            }
+            recorder.begin_render_pass(desc);
+            recorder.end_render_pass();
         }
 
         Ok(())
@@ -2279,17 +2273,8 @@ pub(super) fn encode_render_pass(
 
     let mut indirect_draw_validation_batcher = crate::indirect_validation::DrawBatcher::new();
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    let mut recorder = PassRecorder::new();
+    let raw_encoder = &mut recorder;
 
     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
         let mut pending_query_resets = QueryResetMap::new();
@@ -2672,7 +2657,6 @@ pub(super) fn encode_render_pass(
         state
             .info
             .finish(
-                device,
                 state.pass.base.raw_encoder,
                 state.pass.base.snatch_guard,
                 &mut state.pass.scope,
@@ -2684,7 +2668,6 @@ pub(super) fn encode_render_pass(
 
         let pending_discard_init_fixups = state.pass.pending_discard_init_fixups;
 
-        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
         (trackers, pending_discard_init_fixups, pending_query_resets)
     };
 
@@ -2692,12 +2675,7 @@ pub(super) fn encode_render_pass(
     let tracker = &mut parent_state.tracker;
 
     {
-        let transit = encoder
-            .open_pass(hal_label(
-                Some("(wgpu internal) Pre Pass"),
-                device.instance_flags,
-            ))
-            .map_pass_err(pass_scope)?;
+        let transit = encoder.open_if_closed().map_pass_err(pass_scope)?;
 
         // If this pass reads any surfaces that were discarded by a previous
         // pass in the same command buffer, initialize them.
@@ -2733,9 +2711,16 @@ pub(super) fn encode_render_pass(
                 )
                 .map_pass_err(pass_scope)?;
         }
-    }
 
-    encoder.close_and_swap().map_pass_err(pass_scope)?;
+        recorder
+            .encode::<RenderPassErrorInner>(
+                transit,
+                device,
+                parent_state.indirect_draw_validation_resources,
+                parent_state.snatch_guard,
+            )
+            .map_pass_err(pass_scope)?;
+    }
 
     Ok(())
 }
@@ -2778,22 +2763,15 @@ fn set_pipeline(
         .blend_constant
         .require(pipeline.flags.contains(PipelineFlags::BLEND_CONSTANT));
 
-    unsafe {
+    pipeline.raw()?;
+    state.pass.base.raw_encoder.set_render_pipeline(&pipeline);
+
+    if pipeline.flags.contains(PipelineFlags::STENCIL_REFERENCE) {
         state
             .pass
             .base
             .raw_encoder
-            .set_render_pipeline(pipeline.raw()?);
-    }
-
-    if pipeline.flags.contains(PipelineFlags::STENCIL_REFERENCE) {
-        unsafe {
-            state
-                .pass
-                .base
-                .raw_encoder
-                .set_stencil_reference(state.stencil_reference);
-        }
+            .set_stencil_reference(state.stencil_reference);
     }
 
     // Rebind resource
@@ -2841,7 +2819,7 @@ fn set_index_buffer(
         .resolve_vertex_or_index_binding_range(offset, size)
         .map_err(RenderCommandError::from)?;
 
-    let raw = buffer.try_raw(state.pass.base.snatch_guard)?;
+    buffer.try_raw(state.pass.base.snatch_guard)?;
 
     state.index.update_buffer(range.clone(), index_format);
 
@@ -2853,14 +2831,13 @@ fn set_index_buffer(
         ),
     );
 
-    unsafe {
-        // SAFETY: The binding range was validated by `resolve_vertex_or_index_binding_range`.
-        hal::DynCommandEncoder::set_index_buffer(
-            state.pass.base.raw_encoder,
-            hal::BufferBinding::new_unchecked(raw, range.start, range.end - range.start),
-            index_format,
-        );
-    }
+    // The binding range was validated by `resolve_vertex_or_index_binding_range`.
+    state.pass.base.raw_encoder.set_index_buffer(
+        &buffer,
+        range.start,
+        range.end - range.start,
+        index_format,
+    );
     Ok(())
 }
 
@@ -2964,9 +2941,7 @@ fn set_blend_constant(state: &mut State, color: &Color) {
         color.b as f32,
         color.a as f32,
     ];
-    unsafe {
-        state.pass.base.raw_encoder.set_blend_constants(&array);
-    }
+    state.pass.base.raw_encoder.set_blend_constants(array);
 }
 
 fn set_stencil_reference(state: &mut State, value: u32) {
@@ -2977,9 +2952,7 @@ fn set_stencil_reference(state: &mut State, value: u32) {
         .pipeline_flags
         .contains(PipelineFlags::STENCIL_REFERENCE)
     {
-        unsafe {
-            state.pass.base.raw_encoder.set_stencil_reference(value);
-        }
+        state.pass.base.raw_encoder.set_stencil_reference(value);
     }
 }
 
@@ -3030,13 +3003,11 @@ fn set_viewport(
         w: rect.w,
         h: rect.h,
     };
-    unsafe {
-        state
-            .pass
-            .base
-            .raw_encoder
-            .set_viewport(&r, depth_min..depth_max);
-    }
+    state
+        .pass
+        .base
+        .raw_encoder
+        .set_viewport(r, depth_min..depth_max);
     Ok(())
 }
 
@@ -3054,9 +3025,7 @@ fn set_scissor(state: &mut State, rect: Rect<u32>) -> Result<(), RenderPassError
         w: rect.w,
         h: rect.h,
     };
-    unsafe {
-        state.pass.base.raw_encoder.set_scissor_rect(&r);
-    }
+    state.pass.base.raw_encoder.set_scissor_rect(r);
     Ok(())
 }
 
@@ -3083,15 +3052,13 @@ fn draw(
         .limits
         .validate_instance_limit(first_instance, instance_count)?;
 
-    unsafe {
-        if instance_count > 0 && vertex_count > 0 {
-            state.pass.base.raw_encoder.draw(
-                first_vertex,
-                vertex_count,
-                first_instance,
-                instance_count,
-            );
-        }
+    if instance_count > 0 && vertex_count > 0 {
+        state.pass.base.raw_encoder.draw(
+            first_vertex,
+            vertex_count,
+            first_instance,
+            instance_count,
+        );
     }
     Ok(())
 }
@@ -3125,16 +3092,14 @@ fn draw_indexed(
         .limits
         .validate_instance_limit(first_instance, instance_count)?;
 
-    unsafe {
-        if instance_count > 0 && index_count > 0 {
-            state.pass.base.raw_encoder.draw_indexed(
-                first_index,
-                index_count,
-                base_vertex,
-                first_instance,
-                instance_count,
-            );
-        }
+    if instance_count > 0 && index_count > 0 {
+        state.pass.base.raw_encoder.draw_indexed(
+            first_index,
+            index_count,
+            base_vertex,
+            first_instance,
+            instance_count,
+        );
     }
     Ok(())
 }
@@ -3177,14 +3142,12 @@ fn draw_mesh_tasks(
     .check_and_compute_total_invocations()
     .map_err(|err| RenderPassErrorInner::Draw(err.into()))?;
 
-    unsafe {
-        if total_count > 0 {
-            state.pass.base.raw_encoder.draw_mesh_tasks(
-                group_count_x,
-                group_count_y,
-                group_count_z,
-            );
-        }
+    if total_count > 0 {
+        state
+            .pass
+            .base
+            .raw_encoder
+            .draw_mesh_tasks([group_count_x, group_count_y, group_count_z]);
     }
     Ok(())
 }
@@ -3248,25 +3211,7 @@ fn multi_draw_indirect(
         ),
     );
 
-    fn draw(
-        raw_encoder: &mut dyn hal::DynCommandEncoder,
-        family: DrawCommandFamily,
-        indirect_buffer: &dyn hal::DynBuffer,
-        offset: u64,
-        count: u32,
-    ) {
-        match family {
-            DrawCommandFamily::Draw => unsafe {
-                raw_encoder.draw_indirect(indirect_buffer, offset, count);
-            },
-            DrawCommandFamily::DrawIndexed => unsafe {
-                raw_encoder.draw_indexed_indirect(indirect_buffer, offset, count);
-            },
-            DrawCommandFamily::DrawMeshTasks => unsafe {
-                raw_encoder.draw_mesh_tasks_indirect(indirect_buffer, offset, count);
-            },
-        }
-    }
+    let kind = IndirectDrawKind::from(family);
 
     if state.pass.base.device.indirect_validation.is_some()
         && family != DrawCommandFamily::DrawMeshTasks
@@ -3284,7 +3229,7 @@ fn multi_draw_indirect(
         }
 
         struct DrawContext<'a> {
-            raw_encoder: &'a mut dyn hal::DynCommandEncoder,
+            recorder: &'a mut PassRecorder,
             device: &'a Device,
 
             indirect_draw_validation_resources: &'a mut crate::indirect_validation::DrawResources,
@@ -3292,6 +3237,7 @@ fn multi_draw_indirect(
 
             indirect_buffer: Arc<Buffer>,
             family: DrawCommandFamily,
+            kind: IndirectDrawKind,
             vertex_or_index_limit: u64,
             instance_limit: u64,
         }
@@ -3314,13 +3260,9 @@ fn multi_draw_indirect(
                 })
             }
             fn draw(&mut self, draw_data: DrawData) {
-                let dst_buffer = self
-                    .indirect_draw_validation_resources
-                    .get_dst_buffer(draw_data.buffer_index);
-                draw(
-                    self.raw_encoder,
-                    self.family,
-                    dst_buffer,
+                self.recorder.draw_indirect(
+                    self.kind,
+                    RecordedBuffer::DrawValidation(draw_data.buffer_index),
                     draw_data.offset,
                     draw_data.count,
                 );
@@ -3328,12 +3270,13 @@ fn multi_draw_indirect(
         }
 
         let mut draw_ctx = DrawContext {
-            raw_encoder: state.pass.base.raw_encoder,
+            recorder: state.pass.base.raw_encoder,
             device: state.pass.base.device,
             indirect_draw_validation_resources: state.pass.base.indirect_draw_validation_resources,
             indirect_draw_validation_batcher,
             indirect_buffer,
             family,
+            kind,
             vertex_or_index_limit: if family == DrawCommandFamily::DrawIndexed {
                 state.index.limit
             } else {
@@ -3372,10 +3315,10 @@ fn multi_draw_indirect(
             .buffers
             .merge_single(&indirect_buffer, wgt::BufferUses::INDIRECT)?;
 
-        draw(
-            state.pass.base.raw_encoder,
-            family,
-            indirect_buffer.try_raw(state.pass.base.snatch_guard)?,
+        indirect_buffer.try_raw(state.pass.base.snatch_guard)?;
+        state.pass.base.raw_encoder.draw_indirect(
+            kind,
+            RecordedBuffer::Buffer(indirect_buffer),
             offset,
             count,
         );
@@ -3432,7 +3375,7 @@ fn multi_draw_indirect_count(
         .merge_single(&indirect_buffer, wgt::BufferUses::INDIRECT)?;
 
     indirect_buffer.check_usage(BufferUsages::INDIRECT)?;
-    let indirect_raw = indirect_buffer.try_raw(state.pass.base.snatch_guard)?;
+    indirect_buffer.try_raw(state.pass.base.snatch_guard)?;
 
     state
         .pass
@@ -3441,7 +3384,7 @@ fn multi_draw_indirect_count(
         .merge_single(&count_buffer, wgt::BufferUses::INDIRECT)?;
 
     count_buffer.check_usage(BufferUsages::INDIRECT)?;
-    let count_raw = count_buffer.try_raw(state.pass.base.snatch_guard)?;
+    count_buffer.try_raw(state.pass.base.snatch_guard)?;
 
     if !offset.is_multiple_of(4) {
         return Err(RenderCommandError::UnalignedIndirectBufferOffset(offset).into());
@@ -3485,35 +3428,14 @@ fn multi_draw_indirect_count(
         ),
     );
 
-    match family {
-        DrawCommandFamily::Draw => unsafe {
-            state.pass.base.raw_encoder.draw_indirect_count(
-                indirect_raw,
-                offset,
-                count_raw,
-                count_buffer_offset,
-                max_count,
-            );
-        },
-        DrawCommandFamily::DrawIndexed => unsafe {
-            state.pass.base.raw_encoder.draw_indexed_indirect_count(
-                indirect_raw,
-                offset,
-                count_raw,
-                count_buffer_offset,
-                max_count,
-            );
-        },
-        DrawCommandFamily::DrawMeshTasks => unsafe {
-            state.pass.base.raw_encoder.draw_mesh_tasks_indirect_count(
-                indirect_raw,
-                offset,
-                count_raw,
-                count_buffer_offset,
-                max_count,
-            );
-        },
-    }
+    state.pass.base.raw_encoder.draw_indirect_count(
+        IndirectDrawKind::from(family),
+        &indirect_buffer,
+        offset,
+        &count_buffer,
+        count_buffer_offset,
+        max_count,
+    );
     Ok(())
 }
 
@@ -3571,23 +3493,26 @@ fn execute_bundle(
         );
     }
 
-    unsafe {
-        bundle.execute(
-            state.pass.base.raw_encoder,
+    let validated_draws = bundle
+        .validate_indirect_draws(
             state.pass.base.indirect_draw_validation_resources,
             indirect_draw_validation_batcher,
             state.pass.base.snatch_guard,
         )
-    }
-    .map_err(|e| match e {
-        ExecutionError::Device(e) => RenderPassErrorInner::Device(e),
-        ExecutionError::DestroyedResource(e) => {
-            RenderPassErrorInner::RenderCommand(RenderCommandError::DestroyedResource(e))
-        }
-        ExecutionError::InvalidResource(e) => {
-            RenderPassErrorInner::RenderCommand(RenderCommandError::InvalidResource(e))
-        }
-    })?;
+        .map_err(|e| match e {
+            ExecutionError::Device(e) => RenderPassErrorInner::Device(e),
+            ExecutionError::DestroyedResource(e) => {
+                RenderPassErrorInner::RenderCommand(RenderCommandError::DestroyedResource(e))
+            }
+            ExecutionError::InvalidResource(e) => {
+                RenderPassErrorInner::RenderCommand(RenderCommandError::InvalidResource(e))
+            }
+        })?;
+    state
+        .pass
+        .base
+        .raw_encoder
+        .execute_bundle(bundle, validated_draws);
 
     unsafe {
         state.pass.scope.merge_render_bundle(&bundle_state.used)?;
